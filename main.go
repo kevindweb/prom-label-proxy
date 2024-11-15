@@ -17,95 +17,61 @@ import (
 	"context"
 	"errors"
 	"flag"
-	"fmt"
 	"log"
 	"net"
 	"net/http"
 	"net/url"
 	"os"
-	"regexp"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/metalmatze/signal/internalserver"
 	"github.com/oklog/run"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/collectors"
 
-	"github.com/prometheus-community/prom-label-proxy/injectproxy"
+	"github.com/prometheus-community/prom-label-proxy/querymw"
 )
-
-type arrayFlags []string
-
-// String is the method to format the flag's value, part of the flag.Value interface.
-// The String method's output will be used in diagnostics.
-func (i *arrayFlags) String() string {
-	return fmt.Sprint(*i)
-}
-
-// Set is the method to set the flag value, part of the flag.Value interface.
-func (i *arrayFlags) Set(value string) error {
-	if value == "" {
-		return nil
-	}
-
-	*i = append(*i, value)
-	return nil
-}
 
 func main() {
 	var (
 		insecureListenAddress  string
 		internalListenAddress  string
 		upstream               string
-		queryParam             string
-		headerName             string
-		label                  string
-		labelValues            arrayFlags
-		enableLabelAPIs        bool
 		unsafePassthroughPaths string // Comma-delimited string.
-		errorOnReplace         bool
-		regexMatch             bool
-		headerUsesListSyntax   bool
-		rulesWithActiveAlerts  bool
+
+		enableBackpressure        bool
+		backpressureMonitoringURL string
+		backpressureQueries       string
+		congestionWindowMin       int
+		congestionWindowMax       int
+
+		enableJitter bool
+		jitterDelay  time.Duration
+
+		enableObserver bool
 	)
 
 	flagset := flag.NewFlagSet(os.Args[0], flag.ExitOnError)
 	flagset.StringVar(&insecureListenAddress, "insecure-listen-address", "", "The address the prom-label-proxy HTTP server should listen on.")
 	flagset.StringVar(&internalListenAddress, "internal-listen-address", "", "The address the internal prom-label-proxy HTTP server should listen on to expose metrics about itself.")
-	flagset.StringVar(&queryParam, "query-param", "", "Name of the HTTP parameter that contains the tenant value.At most one of -query-param, -header-name and -label-value should be given. If the flag isn't defined and neither -header-name nor -label-value is set, it will default to the value of the -label flag.")
-	flagset.StringVar(&headerName, "header-name", "", "Name of the HTTP header name that contains the tenant value. At most one of -query-param, -header-name and -label-value should be given.")
 	flagset.StringVar(&upstream, "upstream", "", "The upstream URL to proxy to.")
-	flagset.StringVar(&label, "label", "", "The label name to enforce in all proxied PromQL queries.")
-	flagset.Var(&labelValues, "label-value", "A fixed label value to enforce in all proxied PromQL queries. At most one of -query-param, -header-name and -label-value should be given. It can be repeated in which case the proxy will enforce the union of values.")
-	flagset.BoolVar(&enableLabelAPIs, "enable-label-apis", false, "When specified proxy allows to inject label to label APIs like /api/v1/labels and /api/v1/label/<name>/values. "+
-		"NOTE: Enable with care because filtering by matcher is not implemented in older versions of Prometheus (>= v2.24.0 required) and Thanos (>= v0.18.0 required, >= v0.23.0 recommended). If enabled and "+
-		"any labels endpoint does not support selectors, the injected matcher will have no effect.")
+	flagset.BoolVar(&enableJitter, "enable-jitter", false, "Use the jitter middleware")
+	flagset.DurationVar(&jitterDelay, "jitter-delay", time.Second, "Random jitter to apply when enabled")
+	flagset.BoolVar(&enableBackpressure, "enable-backpressure", false, "Use the additive increase multiplicative decrease middleware using backpressure metrics")
+	flagset.IntVar(&congestionWindowMin, "backpressure-min-window", 0, "Min concurrent queries to passthrough regardless of spikes in backpressure.")
+	flagset.IntVar(&congestionWindowMax, "backpressure-max-window", 0, "Max concurrent queries to passthrough regardless of backpressure health.")
+	flagset.StringVar(&backpressureMonitoringURL, "backpressure-monitoring-url", "", "The address on which to read backpressure metrics with PromQL queries.")
+	flagset.StringVar(&backpressureQueries, "backpressure-queries", "", "Newline separated allow list of queries that signifiy increase in downstream failure. Will be used to reduce congestion window. "+
+		"Queries should be in the form of `sum(rate(throughput[5m])) > 100tbps` where an empty result means no backpressure is occuring")
+	flagset.BoolVar(&enableObserver, "enable-observer", false, "Collect middleware latency and error metrics")
 	flagset.StringVar(&unsafePassthroughPaths, "unsafe-passthrough-paths", "", "Comma delimited allow list of exact HTTP path segments that should be allowed to hit upstream URL without any enforcement. "+
 		"This option is checked after Prometheus APIs, you cannot override enforced API endpoints to be not enforced with this option. Use carefully as it can easily cause a data leak if the provided path is an important "+
 		"API (like /api/v1/configuration) which isn't enforced by prom-label-proxy. NOTE: \"all\" matching paths like \"/\" or \"\" and regex are not allowed.")
-	flagset.BoolVar(&errorOnReplace, "error-on-replace", false, "When specified, the proxy will return HTTP status code 400 if the query already contains a label matcher that differs from the one the proxy would inject.")
-	flagset.BoolVar(&regexMatch, "regex-match", false, "When specified, the tenant name is treated as a regular expression. In this case, only one tenant name should be provided.")
-	flagset.BoolVar(&headerUsesListSyntax, "header-uses-list-syntax", false, "When specified, the header line value will be parsed as a comma-separated list. This allows a single tenant header line to specify multiple tenant names.")
-	flagset.BoolVar(&rulesWithActiveAlerts, "rules-with-active-alerts", false, "When true, the proxy will return alerting rules with active alerts matching the tenant label even when the tenant label isn't present in the rule's labels.")
 
 	//nolint: errcheck // Parse() will exit on error.
 	flagset.Parse(os.Args[1:])
-	if label == "" {
-		log.Fatalf("-label flag cannot be empty")
-	}
-
-	if len(labelValues) == 0 && queryParam == "" && headerName == "" {
-		queryParam = label
-	}
-
-	if len(labelValues) > 0 {
-		if queryParam != "" || headerName != "" {
-			log.Fatalf("at most one of -query-param, -header-name and -label-value must be set")
-		}
-	} else if queryParam != "" && headerName != "" {
-		log.Fatalf("at most one of -query-param, -header-name and -label-value must be set")
-	}
 
 	upstreamURL, err := url.Parse(upstream)
 	if err != nil {
@@ -122,61 +88,37 @@ func main() {
 		collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}),
 	)
 
-	opts := []injectproxy.Option{injectproxy.WithPrometheusRegistry(reg)}
-	if enableLabelAPIs {
-		opts = append(opts, injectproxy.WithEnabledLabelsAPI())
-	}
+	opts := []querymw.Option{querymw.WithPrometheusRegistry(reg)}
 
 	if len(unsafePassthroughPaths) > 0 {
-		opts = append(opts, injectproxy.WithPassthroughPaths(strings.Split(unsafePassthroughPaths, ",")))
+		opts = append(opts, querymw.WithPassthroughPaths(strings.Split(unsafePassthroughPaths, ",")))
 	}
 
-	if errorOnReplace {
-		opts = append(opts, injectproxy.WithErrorOnReplace())
+	cfg := querymw.Config{
+		EnableBackpressure:        enableBackpressure,
+		BackpressureMonitoringURL: backpressureMonitoringURL,
+		BackpressureQueries:       strings.Split(backpressureQueries, "\n"),
+		CongestionWindowMin:       congestionWindowMin,
+		CongestionWindowMax:       congestionWindowMax,
+
+		EnableJitter: enableJitter,
+		JitterDelay:  jitterDelay,
+
+		EnableObserver:   enableObserver,
+		ObserverRegistry: reg,
 	}
-
-	if rulesWithActiveAlerts {
-		opts = append(opts, injectproxy.WithActiveAlerts())
-	}
-
-	if regexMatch {
-		if len(labelValues) > 0 {
-			if len(labelValues) > 1 {
-				log.Fatalf("Regex match is limited to one label value")
-			}
-
-			compiledRegex, err := regexp.Compile(labelValues[0])
-			if err != nil {
-				log.Fatalf("Invalid regexp: %v", err.Error())
-				return
-			}
-
-			if compiledRegex.MatchString("") {
-				log.Fatalf("Regex should not match empty string")
-				return
-			}
-		}
-
-		opts = append(opts, injectproxy.WithRegexMatch())
-	}
-
-	var extractLabeler injectproxy.ExtractLabeler
-	switch {
-	case len(labelValues) > 0:
-		extractLabeler = injectproxy.StaticLabelEnforcer(labelValues)
-	case queryParam != "":
-		extractLabeler = injectproxy.HTTPFormEnforcer{ParameterName: queryParam}
-	case headerName != "":
-		extractLabeler = injectproxy.HTTPHeaderEnforcer{Name: http.CanonicalHeaderKey(headerName), ParseListSyntax: headerUsesListSyntax}
+	mw, err := querymw.NewMiddlewareFromConfig(cfg)
+	if err != nil {
+		log.Fatalf("failed to create middleware from config: %v", err)
 	}
 
 	var g run.Group
 
 	{
 		// Run the insecure HTTP server.
-		routes, err := injectproxy.NewRoutes(upstreamURL, label, extractLabeler, opts...)
+		routes, err := querymw.NewRoutes(mw, upstreamURL, opts...)
 		if err != nil {
-			log.Fatalf("Failed to create injectproxy Routes: %v", err)
+			log.Fatalf("Failed to create querymw Routes: %v", err)
 		}
 
 		mux := http.NewServeMux()
